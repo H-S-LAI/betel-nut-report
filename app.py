@@ -5,7 +5,7 @@ import os
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 
-# --- 1. 核心功能：全能讀取與修復 (維持不變) ---
+# --- 1. 核心功能：全能讀取與修復 ---
 def load_and_fix_smart(uploaded_file):
     file_name = uploaded_file.name
     file_ext = os.path.splitext(file_name)[1].lower()
@@ -70,7 +70,7 @@ def load_and_fix_smart(uploaded_file):
             return None, f"資料標準化失敗: {e}"
     return None, "Unknown Error"
 
-# --- 功能：安全寫入 (解決 MergedCell 錯誤) ---
+# --- 功能：安全寫入 ---
 def safe_write(ws, row, col, value):
     cell = ws.cell(row=row, column=col)
     if isinstance(cell, MergedCell):
@@ -82,7 +82,7 @@ def safe_write(ws, row, col, value):
     else:
         cell.value = value
 
-# --- 2. 核心功能：填寫 Excel (V11 智慧跳躍版) ---
+# --- 2. 核心功能：填寫 Excel (V12 精準欄位版) ---
 def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map):
     if isinstance(template_path_or_file, str):
         wb = load_workbook(template_path_or_file)
@@ -95,7 +95,9 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
     # ==========================================
     global_total_grains_by_product = {} 
     global_total_packs_all = 0
-    col_product_map = {}
+    
+    # 關鍵修正：只紀錄「數值欄位 (Value Columns)」來填寫總計
+    value_column_map = {} # col_index -> product_name
 
     # 1. 整理銷售數據
     data_dict = {}
@@ -150,6 +152,7 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
                     if key_prod in prod_name_in_excel or prod_name_in_excel in key_prod:
                         sales_val = data_dict[store_name][key_prod]
                         break
+                # 強制更新：即使是 0 也要看情況，但通常只更新 > 0，除非要清空
                 if sales_val > 0:
                     safe_write(ws, r, sales_col, sales_val)
 
@@ -169,6 +172,7 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
 
         for col in range(1, ws.max_column + 1):
             found_product = None
+            # 往上看找產品名
             for offset in range(1, 6):
                 val = ws.cell(row=r_pack - offset, column=col).value
                 if val and isinstance(val, str) and len(val) > 1:
@@ -180,46 +184,39 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
                         break
             
             if found_product:
-                col_product_map[col] = found_product
-                col_product_map[col + 1] = found_product
+                # 這裡很關鍵：found_product 是在 col 這一欄找到的 (也就是品名/設定欄)
+                # 真正的銷售數字是在 col + 1 (右邊那欄)
+                value_col = col + 1
+                value_column_map[value_col] = found_product
 
-                # 更新綠色 (粒數設定)
+                # 1. 更新綠色 (粒數設定) - 在 col
                 setting_val = grains_per_pack_map.get(found_product)
                 safe_write(ws, r_pack, col, setting_val)
                 
-                # 計算紅色
+                # 2. 計算紅色 - 在 col + 1 (value_col)
                 current_red_sum = 0
                 for offset in range(1, 20):
                     r_scan = r_pack - offset
                     if r_scan <= header_row: break
-                    val = ws.cell(row=r_scan, column=col + 1).value
+                    val = ws.cell(row=r_scan, column=value_col).value
                     if isinstance(val, (int, float)):
                         current_red_sum += val
                 
                 # 寫入紅色
-                cell_red = ws.cell(row=r_pack, column=col + 1)
-                cell_red_val = 0
-                if isinstance(cell_red, MergedCell):
-                     cell_red_val = current_red_sum
-                else:
-                     cell_red_val = cell_red.value
-                     if not isinstance(cell_red_val, (int, float)):
-                         cell_red_val = current_red_sum
-                
-                safe_write(ws, r_pack, col + 1, cell_red_val)
-                global_total_packs_all += cell_red_val
+                safe_write(ws, r_pack, value_col, current_red_sum)
+                global_total_packs_all += current_red_sum
 
-                # 寫入藍色
-                total_grains = cell_red_val * setting_val
+                # 3. 寫入藍色 - 在 col + 1 (value_col)
+                total_grains = current_red_sum * setting_val
                 if r_grain != -1:
-                    safe_write(ws, r_grain, col + 1, total_grains)
+                    safe_write(ws, r_grain, value_col, total_grains)
                 
                 if found_product not in global_total_grains_by_product:
                     global_total_grains_by_product[found_product] = 0
                 global_total_grains_by_product[found_product] += total_grains
 
     # ==========================================
-    # 4. 處理「粒數總計」列 與 「總粒數 / 總包數」 (重要修正！)
+    # 4. 處理「粒數總計」 (只填寫售量欄位)
     # ==========================================
     
     row_summary = -1
@@ -234,42 +231,32 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
     # A. 填寫「粒數總計」列
     exclude_list = ["多菁", "普通"]
     if row_summary != -1:
-        for col in range(1, ws.max_column + 1):
-            prod_name = col_product_map.get(col)
-            if prod_name:
-                if prod_name not in exclude_list:
-                    val = global_total_grains_by_product.get(prod_name, 0)
-                    safe_write(ws, row_summary, col, val)
-                else:
-                    safe_write(ws, row_summary, col, "")
+        # 只遍歷我們標記過的「數值欄位」 (value_column_map)
+        for col, prod_name in value_column_map.items():
+            if prod_name not in exclude_list:
+                val = global_total_grains_by_product.get(prod_name, 0)
+                safe_write(ws, row_summary, col, val)
+            else:
+                safe_write(ws, row_summary, col, "")
 
-    # B. 填寫「總粒數」與「總包數」 (Smart Jump 邏輯)
+    # B. 填寫「總粒數」與「總包數」
     grand_total_grains = sum(global_total_grains_by_product.values())
     
-    # 從下往上掃描
     for r in range(ws.max_row, 1, -1):
-        for c in range(1, 20): # 掃描前 20 欄
+        for c in range(1, 20): 
             current_cell = ws.cell(row=r, column=c)
             val = str(current_cell.value).strip()
             
-            # 判斷是否為關鍵字
             is_total_grains = "總粒數" in val
             is_total_packs = "總包數" in val
             
             if is_total_grains or is_total_packs:
-                # --- 核心修改：判斷要寫入哪一欄 ---
-                target_col = c + 1 # 預設是右邊一格
-                
-                # 檢查當前格子 (標題格) 是否有被合併
-                # 如果是 AB 合併，那 c=1 (A)，但我們應該跳過 A, B，寫入 C (3)
+                target_col = c + 1
                 for rng in ws.merged_cells.ranges:
                     if current_cell.coordinate in rng:
-                        # 找到了！標題是被合併的
-                        # 我們的目標是：合併範圍的最右邊 (max_col) 的下一格
                         target_col = rng.max_col + 1
                         break
                 
-                # 寫入正確的數值
                 if is_total_grains:
                     safe_write(ws, r, target_col, grand_total_grains)
                 elif is_total_packs:
@@ -280,8 +267,8 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
     output.seek(0)
     return output
 
-# --- 3. Streamlit 介面 (維持不變) ---
-st.set_page_config(page_title="檳榔報表生成器 (v11 座標修正版)", layout="wide")
+# --- 3. Streamlit 介面 ---
+st.set_page_config(page_title="檳榔報表生成器 (v12 數據透視版)", layout="wide")
 st.title("🏭 檳榔銷售報表自動生成")
 
 DEFAULT_TEMPLATE = "檳榔銷售統計.xlsx"
@@ -332,6 +319,8 @@ if st.button("🚀 生成報表", type="primary"):
             for f in source_files:
                 df, msg = load_and_fix_smart(f)
                 if df is not None:
+                    # 紀錄來源檔名，方便排查
+                    df['來源檔案'] = f.name 
                     all_data.append(df)
                 else:
                     error_logs.append(f"❌ {f.name}: {msg}")
@@ -345,9 +334,14 @@ if st.button("🚀 生成報表", type="primary"):
                 combined_df = pd.concat(all_data, ignore_index=True)
                 st.info(f"✅ 成功讀取 {len(combined_df)} 筆資料。")
                 
+                # --- 新增：數據檢查區 ---
+                with st.expander("🔍 點擊這裡查看程式讀到的詳細數據 (檢查 24 有沒有變 100)"):
+                    st.dataframe(combined_df)
+                # ---------------------
+
                 try:
                     result_excel = fill_excel_template(current_template, combined_df, user_grains_setting)
-                    st.success("報表生成成功！總粒數與總包數位置已修正。")
+                    st.success("報表生成成功！粒數總計已修正位置。")
                     st.download_button(
                         label="📥 下載報表",
                         data=result_excel,
