@@ -4,63 +4,75 @@ import io
 import os
 from openpyxl import load_workbook
 
-# --- 1. 核心功能：超強韌檔案讀取 (修復版) ---
+# --- 1. 核心功能：終極讀取邏輯 (位置鎖定版) ---
 def load_and_fix_csv(uploaded_file):
     """
-    讀取上傳的 CSV 檔案，具備多重編碼嘗試與容錯機制。
+    不管編碼多亂，強制用欄位位置 (Index) 來抓資料。
     """
+    bytes_data = uploaded_file.getvalue()
+    
+    # 準備多種解碼方式來嘗試
+    decoding_attempts = []
+    
+    # 1. 針對你的亂碼特徵 (UTF-8 誤讀 Big5) 的專屬修復
     try:
-        bytes_data = uploaded_file.getvalue()
-        content = ""
+        text_utf8 = bytes_data.decode('utf-8')
+        if '©±' in text_utf8: # 這是你檔案裡 "店名" 的亂碼特徵
+             try:
+                 # 嘗試還原成中文
+                 fixed = text_utf8.encode('latin1').decode('cp950', errors='ignore')
+                 decoding_attempts.append(fixed)
+             except: pass
+        decoding_attempts.append(text_utf8) # 也試試原本的
+    except:
+        pass
         
-        # 策略 A: 嘗試 UTF-8 讀取，並檢查是否為亂碼 (Mojibake)
-        # 這是針對你目前檔案最可能的情況 (UTF-8 裡面包著 Big5 的亂碼)
-        try:
-            text_utf8 = bytes_data.decode('utf-8')
-            if '©±' in text_utf8: # 偵測到亂碼特徵
-                try:
-                    # 使用 cp950 (比 big5 寬容) 並且使用 replace 忽略錯誤字元
-                    content = text_utf8.encode('latin1').decode('cp950', errors='replace')
-                except:
-                    # 如果轉碼失敗，就直接用原本的 UTF-8 (雖然是亂碼，但至少程式不會掛)
-                    content = text_utf8
-            else:
-                content = text_utf8
-        except UnicodeDecodeError:
-            # 策略 B: 如果不是 UTF-8，嘗試直接用 CP950 (常見的中文編碼)
-            try:
-                content = bytes_data.decode('cp950', errors='replace')
-            except:
-                # 策略 C: 最後手段，用 Latin1 硬讀，保證不報錯
-                content = bytes_data.decode('latin1', errors='replace')
+    # 2. 傳統中文編碼 (CP950/Big5)
+    try:
+        decoding_attempts.append(bytes_data.decode('cp950', errors='ignore'))
+    except:
+        pass
+        
+    # 3. 英文/原始編碼 (保底，至少不會報錯)
+    try:
+        decoding_attempts.append(bytes_data.decode('latin1', errors='ignore'))
+    except:
+        pass
 
-        # 讀取 CSV
-        df = pd.read_csv(io.StringIO(content))
-        
-        # 欄位對應與更名
-        col_map = {
-            '©±¦W': '店名',
-            '«~¦W': '品名',
-            '°â¶q': '售量'
-        }
-        df = df.rename(columns=col_map)
-        
-        # 檢查關鍵欄位 (容許些許誤差)
-        if '店名' in df.columns and '售量' in df.columns:
-            # 只取需要的欄位，並去除空值
-            df = df[['店名', '品名', '售量']].dropna()
-            # 強制將售量轉為數字，無法轉的變成 0
-            df['售量'] = pd.to_numeric(df['售量'], errors='coerce').fillna(0)
-            return df
-        else:
-            # 如果欄位沒對上，可能是標題列也有亂碼，嘗試直接回傳看一下結構 (Debug用)
-            # 但為了流程順暢，這裡回傳 None
-            st.warning(f"檔案 {uploaded_file.name} 讀取成功但找不到「店名/售量」欄位，請檢查內容。")
-            return None
+    # 開始逐一測試
+    for content in decoding_attempts:
+        try:
+            # 關鍵修正：
+            # 1. sep=',': 強制指定逗號分隔，解決 "Expected 1 fields" 錯誤
+            # 2. on_bad_lines='skip': 遇到壞掉的行 (如結尾的加總說明) 直接跳過，不准報錯
+            df = pd.read_csv(io.StringIO(content), sep=',', on_bad_lines='skip')
             
-    except Exception as e:
-        st.error(f"檔案 {uploaded_file.name} 嚴重錯誤: {e}")
-        return None
+            # 檢查欄位數量是否足夠 (你需要抓到第 4 欄)
+            if df.shape[1] < 4:
+                continue
+                
+            # --- 欄位鎖定策略 ---
+            # 不管標題叫 '©±¦W' 還是 '店名'，我們直接抓位置
+            # Index 1 = 店名, Index 2 = 品名, Index 3 = 售量
+            
+            target_df = df.iloc[:, [1, 2, 3]].copy()
+            target_df.columns = ['店名', '品名', '售量'] # 強制改名
+            
+            # 簡單驗證：售量那一欄應該要有數字
+            # 我們試著把售量轉數字，如果成功轉換的比例高，就代表抓對了
+            numeric_check = pd.to_numeric(target_df['售量'], errors='coerce')
+            if numeric_check.notna().sum() > 0:
+                # 清理資料
+                target_df['售量'] = numeric_check.fillna(0)
+                target_df = target_df.dropna(subset=['店名']) # 店名不能是空的
+                return target_df
+                
+        except Exception:
+            continue # 換下一個編碼試試
+            
+    # 如果試了所有方法都失敗
+    st.error(f"檔案 {uploaded_file.name} 徹底讀取失敗，請確認它是否為逗號分隔的 CSV/XLS。")
+    return None
 
 # --- 2. 核心功能：處理 Excel 模板 ---
 def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map):
@@ -86,7 +98,9 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
     # 掃描 header (假設在第 1~10 列之間)
     header_row = 3
     for r in range(1, 10):
-        if ws.cell(row=r, column=1).value == "店名":
+        # 找任何看起來像是 "店名" 的格子 (有些模板可能有空白)
+        val = ws.cell(row=r, column=1).value
+        if val and "店" in str(val): 
             header_row = r
             break
             
@@ -96,8 +110,8 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
         val = ws.cell(row=header_row, column=col).value
         if val and isinstance(val, str):
             product_name = val.strip()
-            # 只要不是售量，且在我們的設定清單中，就視為產品
-            if product_name != "售量" and product_name in grains_per_pack_map:
+            # 排除 "售量" 字眼，剩下的如果是我們的產品名，就記錄下來
+            if "售" not in product_name and product_name in grains_per_pack_map:
                 product_col_map[product_name] = col
 
     total_sales_packs = {p: 0 for p in product_col_map}
@@ -172,7 +186,7 @@ with col2:
     st.markdown("### 2. 原始數據")
     source_files = st.file_uploader("請一次上傳所有數據檔案", type=["csv", "xls"], accept_multiple_files=True)
 
-# 參數設定 (可根據需求修改預設值)
+# 參數設定
 default_grains = {
     "特幼": 8, "幼大口": 8, "多粒": 12, "多大口": 12,
     "幼菁": 10, "雙子星": 10, "多菁": 10, "普通": 10
@@ -214,4 +228,4 @@ if st.button("🚀 生成報表", type="primary"):
                 except Exception as e:
                     st.error(f"填寫 Excel 時發生錯誤: {e}")
             else:
-                st.error("所有檔案讀取失敗，請檢查檔案格式。")
+                st.error("所有檔案讀取失敗，請檢查檔案是否為正確的 CSV/XLS 格式。")
