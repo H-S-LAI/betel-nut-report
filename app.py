@@ -4,99 +4,120 @@ import io
 import os
 from openpyxl import load_workbook
 
-# --- 1. 核心功能：智慧讀取與修復 ---
-def load_and_fix_csv_smart(uploaded_file):
+# --- 1. 核心功能：全能讀取與修復 (支援 Excel 與 CSV) ---
+def load_and_fix_smart(uploaded_file):
     """
-    1. 嘗試修復亂碼 (UTF-8 -> CP950)
-    2. 自動尋找「店名」所在的行數，跳過上方的標題雜訊
+    自動判斷副檔名：
+    - xls/xlsx: 使用 pandas 原生 excel 讀取 (解決二進位亂碼問題)
+    - csv: 使用智慧解碼 (解決 Big5/UTF-8 混亂問題)
+    最後統一輸出格式標準的 DataFrame
     """
     file_name = uploaded_file.name
-    bytes_data = uploaded_file.getvalue()
+    file_ext = os.path.splitext(file_name)[1].lower()
     
-    # -----------------------
-    # A. 解碼階段 (Decoding)
-    # -----------------------
-    content = ""
-    decoded_method = ""
-    
-    # 策略 1: 針對你的檔案特徵 (Double Encoded)
-    # 你的檔案看起來是被 UTF-8 包裝過的 Big5
-    try:
-        text_utf8 = bytes_data.decode('utf-8')
-        if '©±' in text_utf8 or '§O' in text_utf8: 
-            # 嘗試還原亂碼
-            content = text_utf8.encode('latin1', errors='ignore').decode('cp950', errors='ignore')
-            decoded_method = "Mojibake Fix"
-        else:
-            content = text_utf8
-            decoded_method = "UTF-8"
-    except:
-        # 策略 2: 直接嘗試 CP950
+    df = None
+    msg = ""
+
+    # ==========================
+    # 分流 1: 處理 Excel (.xls, .xlsx)
+    # ==========================
+    if file_ext in ['.xls', '.xlsx']:
         try:
-            content = bytes_data.decode('cp950', errors='ignore')
-            decoded_method = "CP950"
-        except:
-            # 策略 3: Latin1 (保底，絕不報錯)
-            content = bytes_data.decode('latin1', errors='ignore')
-            decoded_method = "Latin1"
-
-    # -----------------------
-    # B. 標題定位 (Header Detection)
-    # -----------------------
-    # 我們將內容切成行，尋找 "店名" 在哪一行
-    lines = content.splitlines()
-    header_row_index = -1
-    
-    for i, line in enumerate(lines[:20]): # 只找前 20 行
-        if "店名" in line and "售量" in line:
-            header_row_index = i
-            break
+            if file_ext == '.xls':
+                # 舊版 Excel (Binary)
+                df = pd.read_excel(uploaded_file, engine='xlrd')
+            else:
+                # 新版 Excel (OpenXML)
+                df = pd.read_excel(uploaded_file, engine='openpyxl')
             
-    if header_row_index == -1:
-        # 找不到 header，可能是編碼徹底失敗，回傳 raw content 供除錯
-        return None, f"找不到標題列 (使用 {decoded_method} 解碼)。前 100 字預覽：\n{content[:100]}"
+            msg = "Excel Read Success"
+        except Exception as e:
+            return None, f"Excel 讀取失敗 (請確認是否安裝 xlrd): {e}"
 
-    # -----------------------
-    # C. 讀取數據
-    # -----------------------
-    try:
-        # 重組從 header 開始的內容
-        valid_content = "\n".join(lines[header_row_index:])
+    # ==========================
+    # 分流 2: 處理 CSV / 文字檔
+    # ==========================
+    else:
+        bytes_data = uploaded_file.getvalue()
+        content = ""
+        decoded_method = ""
         
-        # 讀取 CSV
-        df = pd.read_csv(io.StringIO(valid_content))
-        
-        # 檢查欄位
-        # 你的檔案結構：第2欄=店名, 第3欄=品名, 第4欄=售量
-        # 因為我們已經從 header 開始讀，所以欄位名稱應該已經正確抓到了 (或者在第一行)
-        
-        # 有時候 header 那一行本身也有亂碼，我們檢查欄位是否包含關鍵字
-        # 如果欄位名不對，我們嘗試用 index 強制鎖定
-        
-        # 建立標準欄位名
-        target_df = pd.DataFrame()
-        
-        # 狀況 1: 欄位名稱正確讀取
-        if '店名' in df.columns and '售量' in df.columns:
-            target_df = df
-        # 狀況 2: 欄位名稱亂掉，但欄位數量夠 (通常 index 1 是店名, 2 是品名, 3 是售量)
-        elif df.shape[1] >= 4:
-            target_df = df.iloc[:, [1, 2, 3]].copy()
-            target_df.columns = ['店名', '品名', '售量']
-        else:
-             return None, f"欄位數量不足 ({df.shape[1]})"
+        # --- A. 解碼階段 ---
+        try:
+            text_utf8 = bytes_data.decode('utf-8')
+            # 偵測是否為「假 UTF-8 真 Big5」(Mojibake)
+            if '©±' in text_utf8 or '§O' in text_utf8: 
+                content = text_utf8.encode('latin1', errors='ignore').decode('cp950', errors='ignore')
+                decoded_method = "Mojibake Fix"
+            else:
+                content = text_utf8
+                decoded_method = "UTF-8"
+        except:
+            try:
+                content = bytes_data.decode('cp950', errors='ignore')
+                decoded_method = "CP950"
+            except:
+                content = bytes_data.decode('latin1', errors='ignore')
+                decoded_method = "Latin1"
 
-        # 最後清理
-        target_df['售量'] = pd.to_numeric(target_df['售量'], errors='coerce').fillna(0)
-        target_df = target_df.dropna(subset=['店名'])
+        # --- B. 標題定位 ---
+        lines = content.splitlines()
+        header_row_index = -1
         
-        # 過濾掉可能重複讀到的標題行
-        target_df = target_df[target_df['店名'].astype(str).str.contains("店名") == False]
-        
-        return target_df, "Success"
+        for i, line in enumerate(lines[:20]): 
+            if "店名" in line and "售量" in line:
+                header_row_index = i
+                break
+                
+        if header_row_index == -1:
+            return None, f"找不到 CSV 標題列 (使用 {decoded_method})。預覽：{content[:50]}"
 
-    except Exception as e:
-        return None, f"解析 CSV 失敗: {e}"
+        # --- C. 讀取數據 ---
+        try:
+            valid_content = "\n".join(lines[header_row_index:])
+            df = pd.read_csv(io.StringIO(valid_content))
+            msg = "CSV Read Success"
+        except Exception as e:
+            return None, f"解析 CSV 失敗: {e}"
+
+    # ==========================
+    # 共同階段: 資料清洗與標準化
+    # ==========================
+    if df is not None:
+        try:
+            target_df = pd.DataFrame()
+
+            # 確保欄位名稱存在 (去除前後空白)
+            df.columns = [str(c).strip() for c in df.columns]
+
+            # 狀況 1: 欄位名稱正確
+            if '店名' in df.columns and '售量' in df.columns:
+                target_df = df
+            
+            # 狀況 2: 欄位名稱跑掉，但欄位數量夠 (Excel 沒讀到 header 時)
+            elif df.shape[1] >= 4:
+                # 假設順序：店別, 店名, 品名, 售量...
+                target_df = df.iloc[:, [1, 2, 3]].copy()
+                target_df.columns = ['店名', '品名', '售量']
+            else:
+                return None, f"欄位識別失敗，請確認檔案包含「店名」與「售量」欄位。"
+
+            # 清理「售量」：轉數字，非數字補 0
+            target_df['售量'] = pd.to_numeric(target_df['售量'], errors='coerce').fillna(0)
+            
+            # 清理「店名」：去除空值
+            target_df = target_df.dropna(subset=['店名'])
+            
+            # 過濾掉可能重複讀到的標題行 (Excel 合併時常見問題)
+            target_df = target_df[target_df['店名'].astype(str).str.contains("店名") == False]
+            
+            return target_df, "Success"
+            
+        except Exception as e:
+            return None, f"資料標準化失敗: {e}"
+            
+    return None, "Unknown Error"
+
 
 # --- 2. 核心功能：填寫 Excel (維持不變) ---
 def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map):
@@ -174,7 +195,7 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
     return output
 
 # --- 3. Streamlit 介面 ---
-st.set_page_config(page_title="檳榔報表生成器 (v6 終極版)", layout="wide")
+st.set_page_config(page_title="檳榔報表生成器 (v7 全能版)", layout="wide")
 st.title("🏭 檳榔銷售報表自動生成")
 
 DEFAULT_TEMPLATE = "檳榔銷售統計.xlsx"
@@ -195,7 +216,8 @@ with col1:
 
 with col2:
     st.markdown("### 2. 原始數據")
-    source_files = st.file_uploader("上傳所有數據檔案", type=["csv", "xls"], accept_multiple_files=True)
+    # 這裡增加了 xlsx 支援
+    source_files = st.file_uploader("上傳所有數據檔案 (支援 xls, xlsx, csv)", type=["csv", "xls", "xlsx"], accept_multiple_files=True)
 
 default_grains = {
     "特幼": 8, "幼大口": 8, "多粒": 12, "多大口": 12,
@@ -224,7 +246,8 @@ if st.button("🚀 生成報表", type="primary"):
             error_logs = []
             
             for f in source_files:
-                df, msg = load_and_fix_csv_smart(f)
+                # 改用新的函式
+                df, msg = load_and_fix_smart(f)
                 if df is not None:
                     all_data.append(df)
                 else:
