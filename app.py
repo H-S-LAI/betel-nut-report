@@ -4,86 +4,91 @@ import io
 import os
 from openpyxl import load_workbook
 
-# --- 1. 核心功能：終極讀取邏輯 (位置鎖定版) ---
-def load_and_fix_csv(uploaded_file):
+# --- 1. 核心功能：亂碼修復 + 暴力過濾雜訊 ---
+def load_and_fix_csv_robust(uploaded_file):
     """
-    不管編碼多亂，強制用欄位位置 (Index) 來抓資料。
+    1. 修復編碼 (UTF-8 -> Latin1 -> CP950)
+    2. 過濾掉沒有逗號的雜訊行 (解決 Expected 1 fields 錯誤)
     """
+    file_name = uploaded_file.name
     bytes_data = uploaded_file.getvalue()
     
-    # 準備多種解碼方式來嘗試
-    decoding_attempts = []
-    
-    # 1. 針對你的亂碼特徵 (UTF-8 誤讀 Big5) 的專屬修復
+    # --- 步驟 A: 解碼 (找回中文字) ---
+    content = ""
+    # 策略 1: 針對你的檔案特徵 (UTF-8 亂碼還原)
     try:
         text_utf8 = bytes_data.decode('utf-8')
-        if '©±' in text_utf8: # 這是你檔案裡 "店名" 的亂碼特徵
-             try:
-                 # 嘗試還原成中文
-                 fixed = text_utf8.encode('latin1').decode('cp950', errors='ignore')
-                 decoding_attempts.append(fixed)
-             except: pass
-        decoding_attempts.append(text_utf8) # 也試試原本的
+        if '©±' in text_utf8: # 偵測到你的亂碼特徵
+            # 這就是你要的 "對照表" 邏輯：反向編碼回 Latin1，再用 CP950 解開
+            content = text_utf8.encode('latin1').decode('cp950', errors='ignore')
+        else:
+            content = text_utf8
     except:
-        pass
-        
-    # 2. 傳統中文編碼 (CP950/Big5)
-    try:
-        decoding_attempts.append(bytes_data.decode('cp950', errors='ignore'))
-    except:
-        pass
-        
-    # 3. 英文/原始編碼 (保底，至少不會報錯)
-    try:
-        decoding_attempts.append(bytes_data.decode('latin1', errors='ignore'))
-    except:
-        pass
-
-    # 開始逐一測試
-    for content in decoding_attempts:
+        # 策略 2: 如果上面失敗，直接試試 CP950
         try:
-            # 關鍵修正：
-            # 1. sep=',': 強制指定逗號分隔，解決 "Expected 1 fields" 錯誤
-            # 2. on_bad_lines='skip': 遇到壞掉的行 (如結尾的加總說明) 直接跳過，不准報錯
-            df = pd.read_csv(io.StringIO(content), sep=',', on_bad_lines='skip')
-            
-            # 檢查欄位數量是否足夠 (你需要抓到第 4 欄)
-            if df.shape[1] < 4:
-                continue
-                
-            # --- 欄位鎖定策略 ---
-            # 不管標題叫 '©±¦W' 還是 '店名'，我們直接抓位置
-            # Index 1 = 店名, Index 2 = 品名, Index 3 = 售量
-            
-            target_df = df.iloc[:, [1, 2, 3]].copy()
-            target_df.columns = ['店名', '品名', '售量'] # 強制改名
-            
-            # 簡單驗證：售量那一欄應該要有數字
-            # 我們試著把售量轉數字，如果成功轉換的比例高，就代表抓對了
-            numeric_check = pd.to_numeric(target_df['售量'], errors='coerce')
-            if numeric_check.notna().sum() > 0:
-                # 清理資料
-                target_df['售量'] = numeric_check.fillna(0)
-                target_df = target_df.dropna(subset=['店名']) # 店名不能是空的
-                return target_df
-                
-        except Exception:
-            continue # 換下一個編碼試試
-            
-    # 如果試了所有方法都失敗
-    st.error(f"檔案 {uploaded_file.name} 徹底讀取失敗，請確認它是否為逗號分隔的 CSV/XLS。")
-    return None
+            content = bytes_data.decode('cp950', errors='ignore')
+        except:
+            content = bytes_data.decode('latin1', errors='ignore')
 
-# --- 2. 核心功能：處理 Excel 模板 ---
+    # --- 步驟 B: 清洗數據 (解決格式錯誤) ---
+    # 這是這次修正的關鍵：不要直接丟給 Pandas 讀，我們先把壞掉的行踢掉
+    valid_lines = []
+    lines = content.splitlines()
+    
+    for line in lines:
+        # 簡單判斷：有效的資料行至少要有 2 個以上的逗號 (店名, 品名, 售量...)
+        if line.count(',') >= 2:
+            valid_lines.append(line)
+            
+    if not valid_lines:
+        st.error(f"檔案 {file_name} 內容看起來是空的或格式全錯。")
+        return None
+
+    # 重組回 CSV 字串
+    clean_content = "\n".join(valid_lines)
+
+    # --- 步驟 C: 轉成表格 ---
+    try:
+        # 這次我們自己指定欄位名稱，不管它標題寫什麼亂碼，反正順序是固定的
+        # header=0 表示第一行是標題 (我們會把它覆蓋掉)
+        df = pd.read_csv(io.StringIO(clean_content), header=0)
+        
+        # 你的檔案結構：第2欄=店名, 第3欄=品名, 第4欄=售量 (Python index 從 0 開始，所以是 1, 2, 3)
+        # 先檢查欄位數夠不夠
+        if df.shape[1] < 4:
+            # 有時候標題行被過濾掉了，試試看有沒有可能是無標題狀態
+            df = pd.read_csv(io.StringIO(clean_content), header=None)
+        
+        if df.shape[1] >= 4:
+            # 強制鎖定我們要的欄位
+            target_df = df.iloc[:, [1, 2, 3]].copy()
+            target_df.columns = ['店名', '品名', '售量']
+            
+            # 清理：確保售量是數字
+            target_df['售量'] = pd.to_numeric(target_df['售量'], errors='coerce').fillna(0)
+            target_df = target_df.dropna(subset=['店名']) # 去除店名空的行
+            
+            # 排除標題行本身被當成資料讀進來的情況 (如果店名那欄寫著 "店名")
+            target_df = target_df[target_df['店名'].astype(str).str.contains("店名|©±") == False]
+            
+            return target_df
+        else:
+            st.warning(f"檔案 {file_name} 欄位不足，無法解析。")
+            return None
+
+    except Exception as e:
+        st.error(f"檔案 {file_name} 解析失敗: {e}")
+        return None
+
+# --- 2. 核心功能：填寫 Excel (維持不變) ---
 def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map):
     if isinstance(template_path_or_file, str):
         wb = load_workbook(template_path_or_file)
     else:
         wb = load_workbook(template_path_or_file)
-        
     ws = wb.active
 
-    # 準備數據字典
+    # 1. 數據匯總
     data_dict = {}
     for index, row in combined_df.iterrows():
         store = str(row['店名']).strip()
@@ -92,25 +97,22 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
         
         if store not in data_dict:
             data_dict[store] = {}
-        # 累加
         data_dict[store][product] = data_dict[store].get(product, 0) + sales
 
-    # 掃描 header (假設在第 1~10 列之間)
+    # 2. 定位標題
     header_row = 3
     for r in range(1, 10):
-        # 找任何看起來像是 "店名" 的格子 (有些模板可能有空白)
         val = ws.cell(row=r, column=1).value
-        if val and "店" in str(val): 
+        if val and "店" in str(val):
             header_row = r
             break
             
-    # 掃描品名欄位
+    # 3. 定位品名欄
     product_col_map = {}
     for col in range(2, ws.max_column + 1):
         val = ws.cell(row=header_row, column=col).value
         if val and isinstance(val, str):
             product_name = val.strip()
-            # 排除 "售量" 字眼，剩下的如果是我們的產品名，就記錄下來
             if "售" not in product_name and product_name in grains_per_pack_map:
                 product_col_map[product_name] = col
 
@@ -118,12 +120,11 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
     row_packs = None
     row_grains = None
     
-    # 填寫數據
+    # 4. 填寫內容
     for row in range(header_row + 1, ws.max_row + 1):
         cell_val = ws.cell(row=row, column=1).value
         if not cell_val:
             continue
-        
         row_label = str(cell_val).strip()
         
         if "銷售包數" in row_label:
@@ -140,18 +141,15 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
                     ws.cell(row=row, column=col_idx + 1).value = val
                     total_sales_packs[product] += val
 
-    # 填寫統計列
+    # 5. 填寫統計
     if row_packs:
         for product, col_idx in product_col_map.items():
-            # A. 綠色字：每包粒數 (填在品名欄)
             grains_setting = grains_per_pack_map.get(product, 0)
             ws.cell(row=row_packs, column=col_idx).value = grains_setting
             
-            # B. 紅色字：總銷售包數 (填在售量欄)
             total_packs = total_sales_packs.get(product, 0)
             ws.cell(row=row_packs, column=col_idx + 1).value = total_packs
 
-            # C. 藍色字：總銷售粒數
             if row_grains:
                 total_grains = total_packs * grains_setting
                 ws.cell(row=row_grains, column=col_idx + 1).value = total_grains
@@ -162,7 +160,7 @@ def fill_excel_template(template_path_or_file, combined_df, grains_per_pack_map)
     return output
 
 # --- 3. Streamlit 介面 ---
-st.set_page_config(page_title="檳榔報表生成器", layout="wide")
+st.set_page_config(page_title="檳榔報表生成器 (強力版)", layout="wide")
 st.title("🏭 檳榔銷售報表自動生成")
 
 DEFAULT_TEMPLATE = "檳榔銷售統計.xlsx"
@@ -172,19 +170,18 @@ col1, col2 = st.columns([1, 2])
 with col1:
     st.markdown("### 1. 模板設定")
     if os.path.exists(DEFAULT_TEMPLATE):
-        st.success(f"✅ 已偵測到預設模板：{DEFAULT_TEMPLATE}")
+        st.success(f"✅ 使用預設模板：{DEFAULT_TEMPLATE}")
         use_default = st.checkbox("使用預設模板", value=True)
         template_file = DEFAULT_TEMPLATE if use_default else None
-        
         if not use_default:
             template_file = st.file_uploader("上傳新模板", type=["xlsx"])
     else:
-        st.warning("⚠️ 未偵測到預設模板，請上傳。")
+        st.warning("⚠️ 請上傳 Excel 模板")
         template_file = st.file_uploader("上傳模板", type=["xlsx"])
 
 with col2:
     st.markdown("### 2. 原始數據")
-    source_files = st.file_uploader("請一次上傳所有數據檔案", type=["csv", "xls"], accept_multiple_files=True)
+    source_files = st.file_uploader("上傳所有數據檔案 (特幼, 雙子星...)", type=["csv", "xls"], accept_multiple_files=True)
 
 # 參數設定
 default_grains = {
@@ -202,23 +199,30 @@ for i, (product, default_val) in enumerate(default_grains.items()):
         user_grains_setting[product] = val
 
 if st.button("🚀 生成報表", type="primary"):
-    if not template_file:
+    if not template_file and not os.path.exists(DEFAULT_TEMPLATE):
         st.error("找不到模板檔案！")
     elif not source_files:
         st.error("請上傳原始數據檔案。")
     else:
-        with st.spinner("處理中..."):
+        # 如果使用者沒上傳新模板，且有勾選預設，則使用預設路徑
+        current_template = template_file if template_file else DEFAULT_TEMPLATE
+        
+        with st.spinner("正在強力解析數據..."):
             all_data = []
             for f in source_files:
-                df = load_and_fix_csv(f)
+                df = load_and_fix_csv_robust(f)
                 if df is not None:
                     all_data.append(df)
             
             if all_data:
                 combined_df = pd.concat(all_data, ignore_index=True)
+                
+                # 顯示一下讀取到的數據量，讓你知道有沒有成功
+                st.info(f"成功讀取 {len(combined_df)} 筆銷售紀錄，正在填寫報表...")
+                
                 try:
-                    result_excel = fill_excel_template(template_file, combined_df, user_grains_setting)
-                    st.success("完成！")
+                    result_excel = fill_excel_template(current_template, combined_df, user_grains_setting)
+                    st.success("報表生成成功！")
                     st.download_button(
                         label="📥 下載報表",
                         data=result_excel,
@@ -228,4 +232,4 @@ if st.button("🚀 生成報表", type="primary"):
                 except Exception as e:
                     st.error(f"填寫 Excel 時發生錯誤: {e}")
             else:
-                st.error("所有檔案讀取失敗，請檢查檔案是否為正確的 CSV/XLS 格式。")
+                st.error("所有檔案都無法讀取，請確認檔案內容是否正確。")
